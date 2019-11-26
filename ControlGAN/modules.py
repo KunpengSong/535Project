@@ -7,9 +7,17 @@ from utils import resize
 
 
 
-class SpatialAttn(nn.Module):
+class Spatial_Attn(nn.Module):
     def __init__(self,word_emb, img_hw, img_channel):
-        super(SpatialAttn,self).__init__()
+        super(Spatial_Attn,self).__init__()
+
+    def forward(self):
+        pass
+
+
+class Channel_Attn(nn.Module):
+    def __init__(self,word_emb, img_hw, img_channel):
+        super(Channel_Attn,self).__init__()
 
     def forward(self):
         pass
