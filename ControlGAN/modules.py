@@ -6,22 +6,34 @@ from utils import true_randperm
 from utils import resize
 
 
-
 class Spatial_Attn(nn.Module):
-    def __init__(self,word_emb, img_hw, img_channel):
+    def __init__(self,word_dim, img_channel, img_hw):
         super(Spatial_Attn,self).__init__()
+        self.FC = nn.Linear(word_dim,img_channel)
+        self.softmax  = nn.Softmax(dim=-1)
 
-    def forward(self):
-        pass
+    def forward(self,feat,word_emb): #b,c,h,w; b,l,768
+        b,c,h,w = feat.shape
+        feat = feat.view(b,c,-1).permute(0,2,1) #b,c,h,w --> b,c,h*w --> b,h*w,c
+        word_emb = self.FC(word_emb).permute(0,2,1) #b,l,768 --> b,l,c --> b,c,l
+        att = self.softmax(torch.bmm(feat,word_emb)) #b,h*w,c;b,c,l --> b,h*w,l
+        att_feat = torch.bmm(att,word_emb.permute(0,2,1)) #b,h*w,c
+        return feat.permute(0,2,1).view(b,c,h,w)
 
 
 class Channel_Attn(nn.Module):
-    def __init__(self,word_emb, img_hw, img_channel):
+    def __init__(self,word_dim, img_channel, img_hw):
         super(Channel_Attn,self).__init__()
+        self.FC = nn.Linear(word_dim,img_hw*img_hw)
+        self.softmax  = nn.Softmax(dim=-1)
 
-    def forward(self):
-        pass
-
+    def forward(self,feat,word_emb): #b,c,h,w; b,l,768
+        b,c,h,w = feat.shape
+        feat = feat.view(b,c,-1) #b,c,h,w --> b,c,h*w
+        word_emb = self.FC(word_emb).permute(0,2,1) #b,l,768 --> b,l,h*w --> b,h*w,l
+        att = self.softmax(torch.bmm(feat,word_emb)) #b,c,h*w;b,h*w,l --> b,c,l
+        att_feat = torch.bmm(att,word_emb.permute(0,2,1)) #b,c,h*w
+        return feat.view(b,c,h,w)
 
 
 class Decoupling_Attn(nn.Module):
