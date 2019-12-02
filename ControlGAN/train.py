@@ -76,21 +76,24 @@ for epoch in range(start_epoch, nepoch):
     for batch_idx, (real_image, word_idx) in tqdm(enumerate(data_loader), total=len(data_loader)):
         real_image = real_image.to(device)
         real_image = [resize(real_image, 64), real_image]
-        
+
         word_idx = word_idx.to(device)
         batch_size = word_idx.shape[0]
 
         word_emb,mem = pretrained_bert.get_word_emb(word_idx) #b, 15, 768
         sentence = pretrained_bert.get_sentence_emb(mem) #b,256
         word_emb,sentence = word_emb.to(device),sentence.to(device)
-        
+
+        #hidden = pretrained_bert_lstm.init_hidden(batch_size)
+        #word_emb, sentence = pretrained_bert_lstm.get_hiddens(word_idx, hidden)
+
         noise = torch.randn(batch_size, 256).to(device)
 
         if fixed_inp is None:
             fixed_inp = noise.clone()
             fixed_wordidx = word_idx.clone()
             vutils.save_image( real_image[-1].clone().add(1).mul(0.5), f'{log_folder}/sample/real_img.jpg')
-        
+
         g_image = net_ig(noise,sentence.detach(),word_emb.detach())
 
         ### 1. train D
@@ -108,10 +111,10 @@ for epoch in range(start_epoch, nepoch):
             weight_fmatch = 0.2
         pred_f, pred_fmatch, _ = net_id(detach(g_image), sentence=sentence.detach(), word_emb=word_emb.detach(), train_perm=False)
         loss_f = F.relu(1 + pred_f).mean() + weight_fmatch * F.relu(1 + pred_fmatch).mean()
-        
+
         loss_d = loss_r + loss_f
         loss_d.backward()
-        
+
 
         LAMBDA = 10 # Gradient penalty lambda hyperparameter.
         gradient_penalty = None
@@ -140,9 +143,9 @@ for epoch in range(start_epoch, nepoch):
         net_ig.zero_grad()
 
         pred_g, pred_gmatch, _ = net_id(g_image, sentence=sentence.detach(), word_emb=word_emb.detach(), train_perm=False)
-        
+
         loss_g = -pred_g.mean() - \
-                    pred_gmatch.mean() 
+                    pred_gmatch.mean()
 
         loss_g.backward()
 
@@ -152,7 +155,7 @@ for epoch in range(start_epoch, nepoch):
         for p, avg_p in zip(net_ig.parameters(), avg_param_G):
             avg_p.mul_(0.999).add_(0.001, p.data)
 
-        
+
         if not gradient_penalty == None:
             losses_gp.update(gradient_penalty.item(), batch_size)
 
@@ -161,8 +164,8 @@ for epoch in range(start_epoch, nepoch):
         losses_d_img.update(pred_r.mean().item(), batch_size)
         losses_d_match.update(pred_match.mean().item(), batch_size)
         losses_d_mismatch.update(pred_mismatch.mean().item(), batch_size)
-        
-        
+
+
         if batch_idx % log_interval == 0:
             print('Epoch: [{0}/{1}]\t'
                     '\nG: img: {losses_g_img.avg:.4f}  match: {losses_g_match.avg:.4f}  gradient-penalty: {losses_gp.avg:.4f}'
@@ -171,7 +174,7 @@ for epoch in range(start_epoch, nepoch):
                     losses_g_img=losses_g_img, losses_g_match=losses_g_match, losses_gp=losses_gp,
                     losses_d_img=losses_d_img, losses_d_match=losses_d_match, losses_d_mismatch=losses_d_mismatch
                     ))
-            
+
             losses_gp.reset()
             losses_g_img.reset()
             losses_g_match.reset()
@@ -180,7 +183,7 @@ for epoch in range(start_epoch, nepoch):
             losses_d_match.reset()
             losses_d_mismatch.reset()
 
-        
+
         if batch_idx % (log_interval*5) == 0:
             with torch.no_grad():
                 fixed_word_emb,fixed_mem = pretrained_bert.get_word_emb(fixed_wordidx) #b, 15, 768
@@ -199,9 +202,9 @@ for epoch in range(start_epoch, nepoch):
     if epoch%1==0:
         backup_para = copy_G_params(net_ig)
         load_params(net_ig, avg_param_G)
-        torch.save( {'ig': net_ig.state_dict(), 
+        torch.save( {'ig': net_ig.state_dict(),
                      'id': net_id.state_dict()}, '%s/checkpoint/%d.pth'%(log_folder ,epoch))
-        torch.save( {'ig': opt_ig.state_dict(), 
+        torch.save( {'ig': opt_ig.state_dict(),
                     'id': opt_id.state_dict()}, '%s/checkpoint/%d_opt.pth'%(log_folder ,epoch))
         load_params(net_ig, backup_para)
 
