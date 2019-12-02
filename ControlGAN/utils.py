@@ -120,29 +120,6 @@ def true_randperm(size, device=torch.device("cuda:0")):
         l, flag = unmatched_randperm(size)
     return torch.LongTensor(l).to(device)
 
-def inver_perm(perm):
-    invers = []
-    perm = list(perm.cpu().numpy().astype(int))
-    for i in range(len(perm)):
-        invers.append(perm.index(i))
-    return torch.Tensor(invers).long()
-
-def generate_square_subsequent_mask(sz):
-    mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
-    mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-    return mask
-
-def mask_text_embedding(text_emb):
-    seq_len, batch_size, emb_dim = text_emb.shape
-    masks = []
-    for _ in range(batch_size):
-        masks.append( torch.randint(0, 2, (seq_len-5, 1, 1)).float() )
-    masks = torch.cat(masks, dim=1)   # shape: seq x b x 1
-    masks = torch.cat( [ torch.ones(3, batch_size, 1), masks, torch.ones(2, batch_size, 1) ], dim=0 )
-    masks = masks.repeat(1, 1, emb_dim)
-    masks.requires_grad = False
-    return masks.to(text_emb.device)
-
 
 class CaptionImageDataset(data.Dataset):
     def __init__(self, img_root, img_meta_path, transform=None):
@@ -157,23 +134,12 @@ class CaptionImageDataset(data.Dataset):
         return len(self.frame)
 
     def __getitem__(self, idx): 
-        img_name = self.frame[idx][0]
+        img_name = self.frame[idx][0]+'.jpg'
         im = Image.open(os.path.join(self.img_root, img_name)).convert('RGB')
         if self.transform is not None:
             im = self.transform(im)
         cap_idx = torch.tensor(self.frame[idx][1])
         return im, cap_idx
-
-class CaptionImageEmbDataset(CaptionImageDataset):
-    def __init__(self, img_root, img_meta_path, transform=None, emb_path='./bird'):
-        super().__init__(img_root, img_meta_path, transform)
-
-        self.emb_path = emb_path
-
-    def __getitem__(self, idx): 
-        im, cap_idx = super().__getitem__(idx)
-        emb = torch.load( self.emb_path + '/' + "%d.pth"%(idx) )
-        return im, emb
 
 
 class BirdCaptionImageDataset(data.Dataset):
@@ -206,8 +172,6 @@ def pad_packed_collate(batch):
     
     images = torch.stack( [pair[0] for pair in batch], dim=0)
     return images, padded_seq.permute(1, 0)
-
-
 
 
 class AverageMeter(object):

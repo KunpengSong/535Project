@@ -1,0 +1,36 @@
+>>>len(bert_dic)		
+66116
+
+
+>>> bert_dic[0]
+{'file': '002.Laysan_Albatross/Laysan_Albatross_0002_1027', 'bert': [1037, 4743, 2007, 1037, 2200, 2146, 3358, 8487, 1998, 1037, 2146, 4197, 23525, 2203, 2203], 'bird': [0, 1, 2, 0, 3, 4, 5, 6, 7, 0, 4, 8, 9, 10, 10]}
+
+
+>>> from pytorch_transformers import BertConfig
+>>> config = BertConfig()
+>>> config.output_hidden_states = True
+>>> bert = BertModel.from_pretrained('bert-base-uncased',config=config)
+>>> id = cap[0]
+>>> id
+'010.Red_winged_Blackbird/Red_Winged_Blackbird_0094_5856'
+>>> id = cap[1]
+>>> id
+[1996, 2235, 4743, 2003, 3262, 2304, 2007, 4589, 3358, 6963, 1998, 2203, 2203, 2203, 2203]
+>>> id = torch.tensor(id).unsqueeze(0)
+>>> len(bert(id)) #take in tensor
+3
+>>> (bert(id))[0].shape
+torch.Size([1, 15, 768])
+>>> (bert(id))[1].shape
+torch.Size([1, 768])
+>>> type((bert(id))[2])
+<class 'tuple'>
+>>> len((bert(id))[2])
+13
+>>> (bert(id))[2][0].shape
+torch.Size([1, 15, 768])
+
+
+>>> bertTokenizer.decode(cap[1]) #take in list
+'the small bird is mostly black with orange wing bars and end end end end'
+
