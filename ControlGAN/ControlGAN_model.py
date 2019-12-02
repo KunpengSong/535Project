@@ -9,6 +9,8 @@ from modules import downBlock
 import torch.nn.functional as F
 from utils import true_randperm
 from pytorch_transformers import BertModel, BertTokenizer, BertConfig
+from torch.autograd import Variable
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 
 class Text_bert(nn.Module):
@@ -24,14 +26,70 @@ class Text_bert(nn.Module):
         word_embs = embs[0] #b,15,768
         mem = embs[2] #tuple: length=13, each: b,15,768, last layer same as word_embs
         return word_embs,mem
-    
+
     def get_sentence_emb(self,mem): # use [4,8,10,12] from [0,1,...,12]
         mem4,mem8,mem10,mem12 = mem[4],mem[8],mem[10],mem[12]
-        
+
         sentence = torch.cat([mem4,mem8,mem10,mem12],dim=-2).permute(0,2,1) #b,15,768 --> b,60,768 --> b,768,60
         #sentence = nn.MaxPool1d(60)(sentence).squeeze(-1) #b,768,60 --> b,768,1 --> b,768
         sentence = torch.nn.functional.adaptive_avg_pool2d(sentence,(256,1)).squeeze(-1) #b,768,60 --> b,256,1 --> b,256
         return sentence
+
+
+class Text_bert_LSTM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        config = BertConfig()
+        config.output_hidden_states = True
+        self.bert = BertModel.from_pretrained('bert-base-uncased',config=config)
+        self.bertTokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+
+        self.ninput = 768
+        self.nlayers = 1
+        self.bidirectional = True
+        self.num_directions = 2 if self.bidirectional else 1
+        self.nhidden = 256 // self.num_directions
+        self.drop_prob = 0.5
+        self.rnn = nn.LSTM(self.ninput, self.nhidden,
+                               self.nlayers, batch_first=True,
+                               dropout=self.drop_prob,
+                               bidirectional=self.bidirectional)
+
+    def get_word_emb(self,words): #tensor: b,15
+        embs = self.bert(words)
+        word_embs = embs[0] #b,15,768
+        mem = embs[2] #tuple: length=13, each: b,15,768, last layer same as word_embs
+        return word_embs,mem
+
+    def get_sentence_emb(self,mem): # use [4,8,10,12] from [0,1,...,12]
+        mem4,mem8,mem10,mem12 = mem[4],mem[8],mem[10],mem[12]
+
+        sentence = torch.cat([mem4,mem8,mem10,mem12],dim=-2).permute(0,2,1) #b,15,768 --> b,60,768 --> b,768,60
+        #sentence = nn.MaxPool1d(60)(sentence).squeeze(-1) #b,768,60 --> b,768,1 --> b,768
+        sentence = torch.nn.functional.adaptive_avg_pool2d(sentence,(256,1)).squeeze(-1) #b,768,60 --> b,256,1 --> b,256
+        return sentence
+
+    def init_hidden(self, batch_size):
+        weight = next(self.parameters()).data
+        return (Variable(weight.new(self.nlayers * self.num_directions,
+                                    batch_size, self.nhidden).zero_()),
+                Variable(weight.new(self.nlayers * self.num_directions,
+                                    batch_size, self.nhidden).zero_()))
+
+    def get_hiddens(self, words, hidden, num_words_each_sample=None):
+        embs = self.bert(words)
+
+        if num_words_each_sample is None:
+            num_words_each_sample = [words.shape[1]] * words.shape[0]
+
+        emb = pack_padded_sequence(embs, num_words_each_sample, batch_first=True)
+        output, hidden = self.rnn(emb, hidden)
+        output = pad_packed_sequence(output, batch_first=True)[0]
+
+        words_emb = output.transpose(1, 2)
+        sent_emb = hidden[0].transpose(0, 1).contiguous().view(
+            -1, self.nhidden * self.num_directions)
+        return words_emb, sent_emb
 
 
 class Attn(nn.Module):
@@ -57,7 +115,7 @@ class G(nn.Module):
         self.conv_8 = nn.Sequential(
                         UnFlatten(),
                         nn.ConvTranspose2d(noise_dim+sentence_dim, channel*2, 4, 1, 0, bias=False),
-                        nn.BatchNorm2d(channel*2), 
+                        nn.BatchNorm2d(channel*2),
                         GLU(),
                         upBlock(channel, channel//2))
 
@@ -68,12 +126,12 @@ class G(nn.Module):
                         upBlock(channel//2, channel//4))
 
         self.attn_32 = Attn(word_dim, 32, channel//4)
-        
+
         self.conv_64 = upBlock(channel//4, channel//4)
-        self.attn_64 = Attn(word_dim, 64, channel//4)        
+        self.attn_64 = Attn(word_dim, 64, channel//4)
 
         self.conv_256 = nn.Sequential(
-                        upBlock(channel//4, channel//8),                        
+                        upBlock(channel//4, channel//8),
                         upBlock(channel//8, channel//16))
 
         self.to_rgb_64 = nn.Sequential(conv3x3(channel//4, 3), nn.Tanh())
@@ -85,12 +143,12 @@ class G(nn.Module):
         feat = torch.cat([noise,sentence],dim=-1).unsqueeze(-1).unsqueeze(-1) #b,256; b,256 --> b,512,1,1
         feat_8 = self.conv_8(feat)
         feat_8 = self.attn_8(feat_8,word_emb)
-        feat_32 = self.conv_32(feat_8) 
+        feat_32 = self.conv_32(feat_8)
         feat_32 = self.attn_32(feat_32, word_emb)
         feat_64 = self.conv_64(feat_32)
         feat_64 = self.attn_64(feat_64, word_emb)
         feat_256 = self.conv_256(feat_64)
-        
+
         return [self.to_rgb_64(feat_64), self.to_rgb_256(feat_256)]
 
 
@@ -106,7 +164,7 @@ class D(nn.Module):
             downBlock(channel//2, channel//2),
         )
 
-        self.from_64 = nn.Sequential( 
+        self.from_64 = nn.Sequential(
             downBlock(3, channel//8),
             downBlock(channel//8, channel//4),
             downBlock(channel//4, channel//2),
@@ -134,12 +192,12 @@ class D(nn.Module):
 
 
     def forward(self, imgs, sentence=None, word_emb=None, train_perm=True):
-        feat_64 = self.from_64(imgs[0]) 
+        feat_64 = self.from_64(imgs[0])
         feat_256 = self.from_256(imgs[1])
 
         logit_1 = self.rf_64(feat_64).view(-1)
         logit_3 = self.rf_256(feat_256).view(-1)
-        
+
         b = imgs[0].shape[0]
         img_feat = torch.cat([feat_64, feat_256], dim=1)
 
