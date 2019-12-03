@@ -11,6 +11,28 @@ import torch.nn.functional as F
 
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
+import os
+import numpy as np
+from PIL import Image
+from tqdm import tqdm
+import random
+import pickle
+from copy import deepcopy
+from shutil import copy
+import torch
+import torch.nn.functional as F
+from torch import nn, optim
+from torch.autograd import Variable, grad
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+from torchvision import utils as vutils
+from torch import optim
+from utils import *
+
+from pytorch_transformers import BertModel, BertTokenizer, BertConfig
+from ControlGAN_model import Text_bert,G,D
+#from ControlGAN_model import Text_bert_LSTM
+
 
 def conv1x1(in_planes, out_planes, bias=False):
     "1x1 convolution with padding"
@@ -18,90 +40,66 @@ def conv1x1(in_planes, out_planes, bias=False):
                      padding=0, bias=bias)
 
 
-class RNN_ENCODER(nn.Module):
-    def __init__(self, ntoken, words_num, ninput=300, drop_prob=0.5,
-                 nhidden=128, nlayers=1, bidirectional=True, rnn_type='LSTM'):
-        super(RNN_ENCODER, self).__init__()
-        self.n_steps = words_num
-        self.ntoken = ntoken  # size of the dictionary
-        self.ninput = ninput  # size of each embedding vector
-        self.drop_prob = drop_prob  # probability of an element to be zeroed
-        self.nlayers = nlayers  # Number of recurrent layers
-        self.bidirectional = bidirectional
-        self.rnn_type = rnn_type
-        if bidirectional:
-            self.num_directions = 2
-        else:
-            self.num_directions = 1
-        # number of features in the hidden state
-        self.nhidden = nhidden // self.num_directions
+SMOOTH_GAMMA1 = 4.0
+SMOOTH_GAMMA2 = 5.0
+SMOOTH_GAMMA3 = 10.0
 
-        self.define_module()
-        self.init_weights()
 
-    def define_module(self):
-        self.encoder = nn.Embedding(self.ntoken, self.ninput)
-        self.drop = nn.Dropout(self.drop_prob)
-        if self.rnn_type == 'LSTM':
-            # dropout: If non-zero, introduces a dropout layer on
-            # the outputs of each RNN layer except the last layer
-            self.rnn = nn.LSTM(self.ninput, self.nhidden,
+class Text_bert_LSTM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        config = BertConfig()
+        config.output_hidden_states = True
+        self.bert = BertModel.from_pretrained('bert-base-uncased',config=config)
+        self.bertTokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+
+        self.ninput = 768
+        self.nlayers = 1
+        self.bidirectional = True
+        self.num_directions = 2 if self.bidirectional else 1
+        self.nhidden = 256 // self.num_directions
+        self.drop_prob = 0.5
+        self.rnn = nn.LSTM(self.ninput, self.nhidden,
                                self.nlayers, batch_first=True,
                                dropout=self.drop_prob,
                                bidirectional=self.bidirectional)
-        elif self.rnn_type == 'GRU':
-            self.rnn = nn.GRU(self.ninput, self.nhidden,
-                              self.nlayers, batch_first=True,
-                              dropout=self.drop_prob,
-                              bidirectional=self.bidirectional)
-        else:
-            raise NotImplementedError
 
-    def init_weights(self):
-        initrange = 0.1
-        self.encoder.weight.data.uniform_(-initrange, initrange)
-        # Do not need to initialize RNN parameters, which have been initialized
-        # http://pytorch.org/docs/master/_modules/torch/nn/modules/rnn.html#LSTM
-        # self.decoder.weight.data.uniform_(-initrange, initrange)
-        # self.decoder.bias.data.fill_(0)
+    def get_word_emb(self,words): #tensor: b,15
+        embs = self.bert(words)
+        word_embs = embs[0] #b,15,WORD_DIM
+        mem = embs[2] #tuple: length=13, each: b,15,WORD_DIM, last layer same as word_embs
+        return word_embs,mem
 
-    def init_hidden(self, bsz):
+    def get_sentence_emb(self,mem): # use [4,8,10,12] from [0,1,...,12]
+        mem4,mem8,mem10,mem12 = mem[4],mem[8],mem[10],mem[12]
+
+        sentence = torch.cat([mem4,mem8,mem10,mem12],dim=-2).permute(0,2,1) #b,15,WORD_DIM --> b,60,WORD_DIM --> b,WORD_DIM,60
+        #sentence = nn.MaxPool1d(60)(sentence).squeeze(-1) #b,WORD_DIM,60 --> b,WORD_DIM,1 --> b,WORD_DIM
+        sentence = torch.nn.functional.adaptive_avg_pool2d(sentence,(256,1)).squeeze(-1) #b,WORD_DIM,60 --> b,256,1 --> b,256
+        return sentence
+
+    def init_hidden(self, batch_size):
         weight = next(self.parameters()).data
-        if self.rnn_type == 'LSTM':
-            return (Variable(weight.new(self.nlayers * self.num_directions,
-                                        bsz, self.nhidden).zero_()),
-                    Variable(weight.new(self.nlayers * self.num_directions,
-                                        bsz, self.nhidden).zero_()))
-        else:
-            return Variable(weight.new(self.nlayers * self.num_directions,
-                                       bsz, self.nhidden).zero_())
+        return (Variable(weight.new(self.nlayers * self.num_directions,
+                                    batch_size, self.nhidden).zero_()),
+                Variable(weight.new(self.nlayers * self.num_directions,
+                                    batch_size, self.nhidden).zero_()))
 
-    def forward(self, captions, cap_lens, hidden, mask=None):
-        # input: torch.LongTensor of size batch x n_steps
-        # --> emb: batch x n_steps x ninput
-        emb = self.drop(self.encoder(captions))
-        #
-        # Returns: a PackedSequence object
-        cap_lens = cap_lens.data.tolist()
-        emb = pack_padded_sequence(emb, cap_lens, batch_first=True)
-        # #hidden and memory (num_layers * num_directions, batch, hidden_size):
-        # tensor containing the initial hidden state for each element in batch.
-        # #output (batch, seq_len, hidden_size * num_directions)
-        # #or a PackedSequence object:
-        # tensor containing output features (h_t) from the last layer of RNN
-        output, hidden = self.rnn(emb, hidden)
-        # PackedSequence object
-        # --> (batch, seq_len, hidden_size * num_directions)
-        output = pad_packed_sequence(output, batch_first=True)[0]
-        # output = self.drop(output)
-        # --> batch x hidden_size*num_directions x seq_len
-        words_emb = output.transpose(1, 2)
-        # --> batch x num_directions*hidden_size
-        if self.rnn_type == 'LSTM':
-            sent_emb = hidden[0].transpose(0, 1).contiguous()
+    def get_hiddens(self, words, hidden, num_words_each_sample=None):
+        embs = self.bert(words)
+
+        if num_words_each_sample is None:
+            _num_words_each_sample = [words.shape[1]] * words.shape[0]
         else:
-            sent_emb = hidden.transpose(0, 1).contiguous()
-        sent_emb = sent_emb.view(-1, self.nhidden * self.num_directions)
+            _num_words_each_sample = num_words_each_sample.data.tolist()
+
+        emb = pack_padded_sequence(embs[0], _num_words_each_sample, batch_first=True)
+        output, hidden = self.rnn(emb, hidden)
+        output = pad_packed_sequence(output, batch_first=True)[0]
+
+        words_emb = output#.transpose(1, 2)
+        sent_emb = hidden[0].transpose(0, 1).contiguous().view(
+            -1, self.nhidden * self.num_directions)
         return words_emb, sent_emb
 
 
@@ -213,13 +211,15 @@ class CNN_ENCODER(nn.Module):
         return features, cnn_code
 
 
+
+
 def build_models(dataset_n_words, batch_size, num_words, embedding_dim, model_file_path, cuda=True):
     if model_file_path.endswith('.pth'):
         text_encoder_model_path = model_file_path
     else:
         text_encoder_model_path = os.path.join(model_file_path, 'text_encoder200.pth')
     # build model ############################################################
-    text_encoder = RNN_ENCODER(dataset_n_words, num_words, nhidden=embedding_dim)
+    text_encoder = Text_bert_LSTM(dataset_n_words, num_words, nhidden=embedding_dim)
     image_encoder = CNN_ENCODER(embedding_dim)
     labels = Variable(torch.LongTensor(range(batch_size)))
     if text_encoder_model_path != '':
@@ -239,21 +239,21 @@ def build_models(dataset_n_words, batch_size, num_words, embedding_dim, model_fi
     return text_encoder, image_encoder, labels
 
 
-def sent_loss(cnn_code, rnn_code, labels, class_ids,
-              batch_size, eps=1e-8):
+def sent_loss(cnn_code, rnn_code, labels, eps=1e-8):
     # ### Mask mis-match samples  ###
     # that come from the same class as the real sample ###
+    batch_size = rnn_code.size(0)
     masks = []
-    if class_ids is not None:
-        for i in range(batch_size):
-            mask = (class_ids == class_ids[i]).astype(np.uint8)
-            mask[i] = 0
-            masks.append(mask.reshape((1, -1)))
-        masks = np.concatenate(masks, 0)
-        # masks: batch_size x batch_size
-        masks = torch.ByteTensor(masks)
-        if cfg.CUDA:
-            masks = masks.cuda()
+    #if class_ids is not None:
+    #    for i in range(batch_size):
+    #        mask = (class_ids == class_ids[i]).astype(np.uint8)
+    #        mask[i] = 0
+    #        masks.append(mask.reshape((1, -1)))
+    #    masks = np.concatenate(masks, 0)
+    #    # masks: batch_size x batch_size
+    #    masks = torch.ByteTensor(masks)
+    #    if cfg.CUDA:
+    #        masks = masks.cuda()
 
     # --> seq_len x batch_size x nef
     if cnn_code.dim() == 2:
@@ -266,12 +266,12 @@ def sent_loss(cnn_code, rnn_code, labels, class_ids,
     # scores* / norm*: seq_len x batch_size x batch_size
     scores0 = torch.bmm(cnn_code, rnn_code.transpose(1, 2))
     norm0 = torch.bmm(cnn_code_norm, rnn_code_norm.transpose(1, 2))
-    scores0 = scores0 / norm0.clamp(min=eps) * cfg.TRAIN.SMOOTH.GAMMA3
+    scores0 = scores0 / norm0.clamp(min=eps) * SMOOTH_GAMMA3
 
     # --> batch_size x batch_size
     scores0 = scores0.squeeze()
-    if class_ids is not None:
-        scores0.data.masked_fill_(masks, -float('inf'))
+    #if class_ids is not None:
+    #    scores0.data.masked_fill_(masks, -float('inf'))
     scores1 = scores0.transpose(0, 1)
     if labels is not None:
         loss0 = nn.CrossEntropyLoss()(scores0, labels)
@@ -290,21 +290,21 @@ def cosine_similarity(x1, x2, dim=1, eps=1e-8):
     return (w12 / (w1 * w2).clamp(min=eps)).squeeze()
 
 
-def words_loss(img_features, words_emb, labels,
-               cap_lens, class_ids, batch_size):
+def words_loss(img_features, words_emb, labels, cap_lens):
     """
         words_emb(query): batch x nef x seq_len
         img_features(context): batch x nef x 17 x 17
     """
+    batch_size = words_emb.size(0)
     masks = []
     att_maps = []
     similarities = []
     cap_lens = cap_lens.data.tolist()
     for i in range(batch_size):
-        if class_ids is not None:
-            mask = (class_ids == class_ids[i]).astype(np.uint8)
-            mask[i] = 0
-            masks.append(mask.reshape((1, -1)))
+        #if class_ids is not None:
+        #    mask = (class_ids == class_ids[i]).astype(np.uint8)
+        #    mask[i] = 0
+        #    masks.append(mask.reshape((1, -1)))
         # Get the i-th text description
         words_num = cap_lens[i]
         # -> 1 x nef x words_num
@@ -319,7 +319,7 @@ def words_loss(img_features, words_emb, labels,
             weiContext: batch x nef x words_num
             attn: batch x words_num x 17 x 17
         """
-        weiContext, attn = func_attention(word, context, cfg.TRAIN.SMOOTH.GAMMA1)
+        weiContext, attn = func_attention(word, context, SMOOTH_GAMMA1)
         att_maps.append(attn[i].unsqueeze(0).contiguous())
         # --> batch_size x words_num x nef
         word = word.transpose(1, 2).contiguous()
@@ -334,7 +334,7 @@ def words_loss(img_features, words_emb, labels,
         row_sim = row_sim.view(batch_size, words_num)
 
         # Eq. (10)
-        row_sim.mul_(cfg.TRAIN.SMOOTH.GAMMA2).exp_()
+        row_sim.mul_(SMOOTH_GAMMA2).exp_()
         row_sim = row_sim.sum(dim=1, keepdim=True)
         row_sim = torch.log(row_sim)
 
@@ -344,16 +344,16 @@ def words_loss(img_features, words_emb, labels,
 
     # batch_size x batch_size
     similarities = torch.cat(similarities, 1)
-    if class_ids is not None:
-        masks = np.concatenate(masks, 0)
-        # masks: batch_size x batch_size
-        masks = torch.ByteTensor(masks)
-        if cfg.CUDA:
-            masks = masks.cuda()
+    #if class_ids is not None:
+    #    masks = np.concatenate(masks, 0)
+    #    # masks: batch_size x batch_size
+    #    masks = torch.ByteTensor(masks)
+    #    if cfg.CUDA:
+    #        masks = masks.cuda()
 
-    similarities = similarities * cfg.TRAIN.SMOOTH.GAMMA3
-    if class_ids is not None:
-        similarities.data.masked_fill_(masks, -float('inf'))
+    similarities = similarities * SMOOTH_GAMMA3
+    #if class_ids is not None:
+    #    similarities.data.masked_fill_(masks, -float('inf'))
     similarities1 = similarities.transpose(0, 1)
     if labels is not None:
         loss0 = nn.CrossEntropyLoss()(similarities, labels)
@@ -407,97 +407,93 @@ def func_attention(query, context, gamma1):
 
 
 def get_dasam_loss(
-        image_encoder, text_encoder,
-        labels, images, captions, cap_lens, class_ids, batch_size):
-    words_features, sent_code = image_encoder(images)
-    
-    hidden = text_encoder.init_hidden(batch_size)
-    words_emb, sent_emb = text_encoder(captions, cap_lens, hidden)
-    
-    w_loss0, w_loss1, attn = words_loss(words_features, words_emb, labels,
-    				    cap_lens, class_ids, batch_size)
-    
-    s_loss0, s_loss1 = \
-        sent_loss(sent_code, sent_emb, labels, class_ids, batch_size)
+        words_features, sent_code, words_emb, sent_emb, labels, cap_lens):
+    w_loss0, w_loss1, attn = words_loss(words_features, words_emb.transpose(1, 2), labels, cap_lens)
+
+    s_loss0, s_loss1 = sent_loss(sent_code, sent_emb, labels)
     loss = w_loss0 + w_loss1 + s_loss0 + s_loss1
     return loss
 
 
+def train_damsm():
+    torch.backends.cudnn.benchmark = True
+
+    image_size = 256
+    batch_size = 4
+    device = torch.device('cuda:3')
+
+    log_interval = 100
+    nepoch = 60
+    grad_clip = 0.25
+    data_name = 'bird'
+    log_folder = get_path('%s_535'%(data_name))
+    start_epoch = 0
+    embedding_dim = 256
+
+    pretrained_bert = Text_bert_LSTM().to(device)
+
+    image_encoder = CNN_ENCODER(embedding_dim).to(device)
+    labels = Variable(torch.LongTensor(range(batch_size))).to(device)
+
+    img_root='/freespace/local/ws383/AttnGAN/data/birds/CUB_200_2011/images'
+    img_meta_root='./file_with_bert_cap.pkl'
+
+    data = CaptionImageDataset(img_root, img_meta_root, transform=trans_maker(image_size, resize=True))
+    data_loader = DataLoader(data, shuffle=True, batch_size=batch_size, num_workers=4)
+
+    losses_gp = AverageMeter()
+    losses_g_img = AverageMeter()
+    losses_g_match = AverageMeter()
+    losses_d_img = AverageMeter()
+    losses_d_match = AverageMeter()
+    losses_d_mismatch = AverageMeter()
+
+    fixed_inp = None
+    fixed_wordidx = None
+
+    para = list()
+    for v in pretrained_bert.parameters():
+        if v.requires_grad:
+            para.append(v)
+    for v in image_encoder.parameters():
+        if v.requires_grad:
+            para.append(v)
+
+    opt_damsm = optim.Adam(para, lr=1e-4, betas=(0.5,0.999))
+
+    for epoch in range(start_epoch, nepoch):
+
+        for batch_idx, (real_image, word_idx) in tqdm(enumerate(data_loader), total=len(data_loader)):
+            real_image = real_image.to(device)
+            word_idx = word_idx.to(device)
+            cap_lens = (word_idx != 2203).sum(dim=1)
+            sorted_cap_lens, sorted_cap_indices = torch.sort(cap_lens, 0, True)
+            real_image = real_image[sorted_cap_indices]
+            word_idx = word_idx[sorted_cap_indices]
+
+            batch_size = word_idx.shape[0]
+
+            hidden = pretrained_bert.init_hidden(batch_size)
+            word_emb, sentence = pretrained_bert.get_hiddens(word_idx, hidden, sorted_cap_lens)
+
+            words_features, sent_code = image_encoder(real_image)
+
+            pretrained_bert.zero_grad()
+            image_encoder.zero_grad()
+            loss = get_dasam_loss(
+                words_features, sent_code, word_emb, sentence,
+                labels, cap_lens)
+
+            loss.backward()
+            opt_damsm.step()
+            print("\rLoss: %s" % loss.data.item())
+
+        if epoch % 10 == 0:
+            torch.save( {'text_encoder': pretrained_bert.state_dict(),
+                         'image_encoder': image_encoder.state_dict(),
+                         'optim': opt_damsm.state_dict()}, '%s/checkpoint/damsm_%d.pth'%(log_folder ,epoch))
+
+
 if __name__ == "__main__":
-    #os.environ['CUDA_VISIBLE_DEVICES'] = "3"
-    import argparse
-    import random
-    import pprint
-    import numpy as np
-    def parse_args():
-        parser = argparse.ArgumentParser(description='Train a DAMSM network')
-        parser.add_argument('--cfg', dest='cfg_file',
-                            help='optional config file',
-                            default='cfg/DAMSM/bird.yml', type=str)
-        parser.add_argument('--gpu', dest='gpu_id', type=int, default=0)
-        parser.add_argument('--data_dir', dest='data_dir', type=str, default='')
-        parser.add_argument('--manualSeed', type=int, help='manual seed')
-        args = parser.parse_args()
-        return args
-    from miscc.config import cfg, cfg_from_file
-    args = parse_args()
-    if args.cfg_file is not None:
-        cfg_from_file(args.cfg_file)
+    train_damsm()
 
-    if args.gpu_id == -1:
-        cfg.CUDA = False
-    else:
-        cfg.GPU_ID = args.gpu_id
-
-    if args.data_dir != '':
-        cfg.DATA_DIR = args.data_dir
-    print('Using config:')
-    pprint.pprint(cfg)
-
-    if not cfg.TRAIN.FLAG:
-        args.manualSeed = 100
-    elif args.manualSeed is None:
-        args.manualSeed = random.randint(1, 10000)
-    random.seed(args.manualSeed)
-    np.random.seed(args.manualSeed)
-    torch.manual_seed(args.manualSeed)
-    if cfg.CUDA:
-        torch.cuda.manual_seed_all(args.manualSeed)
-
-
-    imsize = cfg.TREE.BASE_SIZE * (2 ** (cfg.TREE.BRANCH_NUM-1))
-    from datasets import TextDataset
-    from datasets import prepare_data
-    import torchvision.transforms as transforms
-    image_transform = transforms.Compose([
-        transforms.Scale(int(imsize * 76 / 64)),
-        transforms.RandomCrop(imsize),
-        transforms.RandomHorizontalFlip()])
-    dataset = TextDataset(cfg.DATA_DIR, 'train',
-                          base_size=cfg.TREE.BASE_SIZE,
-                          transform=image_transform)
-
-
-    dataset_n_words = dataset.n_words
-    num_words = cfg.TEXT.WORDS_NUM
-    embedding_dim = cfg.TEXT.EMBEDDING_DIM
-    model_file_path = '../bird/text_encoder200.pth'
-    batch_size = cfg.TRAIN.BATCH_SIZE
-
-
-    text_encoder, image_encoder, labels = build_models(
-        dataset_n_words, batch_size, num_words, embedding_dim, model_file_path)
-
-
-    dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=batch_size, drop_last=True,
-        shuffle=True, num_workers=int(cfg.WORKERS))
-
-    for step, data in enumerate(dataloader, 0):
-        real_imgs, captions, cap_lens, \
-                class_ids, keys = prepare_data(data)
-
-        get_dasam_loss(
-            image_encoder, text_encoder, labels, real_imgs[-1], captions, cap_lens,
-            class_ids, batch_size)   
-        break
